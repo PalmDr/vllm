@@ -277,6 +277,7 @@ _CROSS_ENCODER_MODELS = {
 _MULTIMODAL_MODELS = {
     # [Decoder-only]
     "AriaForConditionalGeneration": ("aria", "AriaForConditionalGeneration"),
+    "OpenVLAForActionPrediction": ("openvla", "OpenVLAForActionPrediction"),
     "AudioFlamingo3ForConditionalGeneration": (
         "audioflamingo3",
         "AudioFlamingo3ForConditionalGeneration",
