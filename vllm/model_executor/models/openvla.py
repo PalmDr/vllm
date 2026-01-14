@@ -24,6 +24,7 @@ from vllm.config.multimodal import BaseDummyOptions, MultiModalConfig
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
@@ -227,11 +228,16 @@ class DINOv2Encoder(nn.Module):
         # DINOv2 with registers: [CLS, register tokens, patches]
         x = torch.cat([cls_token, reg_tokens, x], dim=1)
 
-        # Transformer blocks
-        for block in self.blocks:
+        # Transformer blocks - use second-to-last layer output to match HF
+        # HF's Prismatic uses get_intermediate_layers(x, n={n_blocks - 2})
+        num_blocks = len(self.blocks)
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            # Stop after second-to-last block (index num_blocks - 2)
+            if i == num_blocks - 2:
+                break
 
-        x = self.norm(x)
+        # NOTE: Do NOT apply final norm - HF doesn't for intermediate layers
 
         # Return patch tokens only (skip CLS and register tokens)
         return x[:, 1 + self.num_register_tokens:, :]
@@ -273,77 +279,159 @@ class SigLIPEncoder(nn.Module):
         # Add positional embedding
         x = x + self.pos_embed
 
-        # Transformer blocks
-        for block in self.blocks:
+        # Transformer blocks - use second-to-last layer output to match HF
+        num_blocks = len(self.blocks)
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            # Stop after second-to-last block (index num_blocks - 2)
+            if i == num_blocks - 2:
+                break
 
-        x = self.norm(x)
+        # NOTE: Do NOT apply final norm - HF doesn't for intermediate layers
         return x  # Return all patch tokens
 
 
 class PrismaticVisionBackbone(nn.Module):
-    """Fused vision backbone combining DINOv2 and SigLIP.
+    """Fused vision backbone combining DINOv2 and SigLIP using timm.
 
     OpenVLA uses a fused dual-encoder vision backbone that concatenates
     features from DINOv2 (structural/geometric) and SigLIP (semantic).
+    Uses timm models for proven correctness.
+
+    IMPORTANT: DINOv2 and SigLIP use different normalization:
+    - DINOv2: HF's quantized ImageNet stats
+    - SigLIP: Simple 0.5 mean/std scaling
     """
+
+    # Normalization constants (HF's exact quantized values for OpenVLA)
+    IMAGENET_MEAN = [0.484375, 0.455078125, 0.40625]
+    IMAGENET_STD = [0.228515625, 0.2236328125, 0.224609375]
+    SIGLIP_MEAN = [0.5, 0.5, 0.5]
+    SIGLIP_STD = [0.5, 0.5, 0.5]
 
     def __init__(
         self,
         image_sizes: list[int],
         use_fused_vision_backbone: bool = True,
+        timm_model_ids: list[str] | None = None,
     ):
         super().__init__()
         self.use_fused = use_fused_vision_backbone
-        image_size = image_sizes[0] if image_sizes else 224
+        self.image_sizes = image_sizes
+        self.timm_model_ids = timm_model_ids or [
+            "vit_large_patch14_reg4_dinov2.lvd142m",
+            "vit_so400m_patch14_siglip_224",
+        ]
 
-        # DINOv2-Large: 1024 dim, 16 heads, 24 blocks
-        self.featurizer = DINOv2Encoder(
-            image_size=image_size,
-            patch_size=14,
-            embed_dim=1024,
-            num_heads=16,
-            num_blocks=24,
-            mlp_ratio=4.0,
-            num_register_tokens=4,
+        # Will be initialized when weights are loaded
+        self.featurizer = None
+        self.fused_featurizer = None
+        self.embed_dim = 2176 if use_fused_vision_backbone else 1024
+
+        # Precompute normalization conversion (ImageNet -> SigLIP)
+        self._init_norm_conversion()
+
+    def _init_norm_conversion(self):
+        """Initialize normalization conversion buffers."""
+        import numpy as np
+
+        imagenet_mean = np.array(self.IMAGENET_MEAN)
+        imagenet_std = np.array(self.IMAGENET_STD)
+        siglip_mean = np.array(self.SIGLIP_MEAN)
+        siglip_std = np.array(self.SIGLIP_STD)
+
+        # x_siglip = x_imagenet * scale + bias
+        scale = imagenet_std / siglip_std
+        bias = (imagenet_mean - siglip_mean) / siglip_std
+
+        self.register_buffer(
+            "norm_scale",
+            torch.tensor(scale, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "norm_bias",
+            torch.tensor(bias, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
         )
 
-        # SigLIP-SO400M: 1152 dim, 16 heads, 27 blocks
-        if use_fused_vision_backbone:
-            self.fused_featurizer = SigLIPEncoder(
-                image_size=image_size,
-                patch_size=14,
-                embed_dim=1152,
-                num_heads=16,
-                num_blocks=27,
-                mlp_dim=4304,  # SigLIP uses non-standard MLP dimension
+    def _convert_imagenet_to_siglip(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Convert ImageNet-normalized input to SigLIP normalization."""
+        scale = self.norm_scale.to(pixel_values.device, pixel_values.dtype)
+        bias = self.norm_bias.to(pixel_values.device, pixel_values.dtype)
+        return pixel_values * scale + bias
+
+    def _init_timm_models(self, device: str = "cuda"):
+        """Initialize timm models. Called during weight loading."""
+        try:
+            import timm
+        except ImportError:
+            raise ImportError("timm is required for OpenVLA: pip install timm")
+
+        img_size = self.image_sizes[0] if self.image_sizes else 224
+
+        # DINOv2 encoder
+        self.featurizer = timm.create_model(
+            self.timm_model_ids[0],
+            pretrained=False,
+            num_classes=0,
+            img_size=img_size,
+        )
+
+        # SigLIP encoder (fused)
+        if self.use_fused:
+            self.fused_featurizer = timm.create_model(
+                self.timm_model_ids[1],
+                pretrained=False,
+                num_classes=0,
+                img_size=img_size,
             )
-            self.embed_dim = 1024 + 1152  # 2176
-        else:
-            self.fused_featurizer = None
-            self.embed_dim = 1024
+
+    def move_to_device(self, device: torch.device):
+        """Move vision backbone to specified device after weight loading."""
+        if self.featurizer is not None:
+            self.featurizer = self.featurizer.to(device)
+        if self.fused_featurizer is not None:
+            self.fused_featurizer = self.fused_featurizer.to(device)
+        # Also move normalization buffers
+        self.norm_scale = self.norm_scale.to(device)
+        self.norm_bias = self.norm_bias.to(device)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Extract and fuse features from both vision encoders.
 
         Args:
             pixel_values: Images of shape (batch, 6, height, width) where
-                          the 6 channels are 2 stacked 3-channel images:
-                          - channels 0-2: image for DINOv2
-                          - channels 3-5: image for SigLIP
+                          channels 0-2: DINOv2 normalized (ImageNet)
+                          channels 3-5: SigLIP normalized
 
         Returns:
             Patch features of shape (batch, num_patches, embed_dim).
         """
-        # Split the stacked images for each encoder
-        # PrismaticProcessor outputs [batch, 6, h, w] = [batch, 2*3, h, w]
-        dinov2_images = pixel_values[:, :3, :, :]  # First 3 channels
-        siglip_images = pixel_values[:, 3:, :, :]  # Last 3 channels
+        if self.featurizer is None:
+            raise RuntimeError("Vision backbone not initialized. Call _init_timm_models first.")
 
-        features = self.featurizer(dinov2_images)
+        # Handle both 6-channel (pre-normalized) and 3-channel input
+        if pixel_values.shape[1] == 6:
+            dinov2_pixels = pixel_values[:, :3, :, :]
+            siglip_pixels = pixel_values[:, 3:, :, :]
+        else:
+            # 3-channel: DINOv2 normalized, convert for SigLIP
+            dinov2_pixels = pixel_values
+            siglip_pixels = self._convert_imagenet_to_siglip(pixel_values)
 
+        # Get features from DINOv2 using second-to-last layer
+        n_blocks = len(self.featurizer.blocks)
+        features = self.featurizer.get_intermediate_layers(
+            dinov2_pixels, n={n_blocks - 2}
+        )[0]
+
+        # Fuse with SigLIP features
         if self.use_fused and self.fused_featurizer is not None:
-            fused_features = self.fused_featurizer(siglip_images)
+            n_fused_blocks = len(self.fused_featurizer.blocks)
+            fused_features = self.fused_featurizer.get_intermediate_layers(
+                siglip_pixels, n={n_fused_blocks - 2}
+            )[0]
             features = torch.cat([features, fused_features], dim=-1)
 
         return features
@@ -782,17 +870,35 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
         """Load OpenVLA weights from HuggingFace checkpoint.
 
         Weight mapping:
-        - vision_backbone.featurizer.* -> DINOv2 weights
-        - vision_backbone.fused_featurizer.* -> SigLIP weights
+        - vision_backbone.featurizer.* -> DINOv2 weights (timm)
+        - vision_backbone.fused_featurizer.* -> SigLIP weights (timm)
         - projector.fc1/fc2/fc3.* -> Projector weights
         - language_model.* -> Llama weights
-        """
-        skip_prefixes = []
-        if self.vision_backbone is None and self.projector is None:
-            skip_prefixes.extend(["vision_backbone.", "projector."])
 
-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        Note: HF checkpoint uses .scale_factor for LayerScale, timm uses .gamma
+        """
+        # Initialize timm models for vision backbone
+        if self.vision_backbone is not None:
+            self.vision_backbone._init_timm_models()
+
+        # Transform weights to handle LayerScale naming difference
+        def transform_weights():
+            for name, weight in weights:
+                # HF uses .scale_factor, timm uses .gamma
+                if ".ls1.scale_factor" in name or ".ls2.scale_factor" in name:
+                    name = name.replace(".scale_factor", ".gamma")
+                yield name, weight
+
+        # Use AutoWeightsLoader for proper handling of packed modules
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(transform_weights(), mapper=self.hf_to_vllm_mapper)
+
+        # Move vision backbone to CUDA after weights are loaded
+        if self.vision_backbone is not None:
+            device = next(self.language_model.parameters()).device
+            self.vision_backbone.move_to_device(device)
+
+        return loaded
 
     def get_mm_mapping(self):
         """Get the module prefix in multimodal models."""
