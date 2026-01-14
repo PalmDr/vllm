@@ -97,7 +97,8 @@ def run_vllm_inference(
 
     results = []
     for image, instruction, name in samples:
-        prompt = f"In: What action should the robot take to {instruction}?\nOut:"
+        # IMPORTANT: HF's OpenVLA uses trailing space which adds token 29871
+        prompt = f"In: What action should the robot take to {instruction}?\nOut: "
 
         request = {
             "prompt": prompt,

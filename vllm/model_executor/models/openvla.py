@@ -411,6 +411,10 @@ class PrismaticVisionBackbone(nn.Module):
         if self.featurizer is None:
             raise RuntimeError("Vision backbone not initialized. Call _init_timm_models first.")
 
+        # Get model dtype from featurizer weights
+        model_dtype = next(self.featurizer.parameters()).dtype
+        device = next(self.featurizer.parameters()).device
+
         # Handle both 6-channel (pre-normalized) and 3-channel input
         if pixel_values.shape[1] == 6:
             dinov2_pixels = pixel_values[:, :3, :, :]
@@ -419,6 +423,11 @@ class PrismaticVisionBackbone(nn.Module):
             # 3-channel: DINOv2 normalized, convert for SigLIP
             dinov2_pixels = pixel_values
             siglip_pixels = self._convert_imagenet_to_siglip(pixel_values)
+
+        # Convert to model dtype and device (float32 -> bfloat16)
+        # This preserves precision during preprocessing but ensures compatibility
+        dinov2_pixels = dinov2_pixels.to(device=device, dtype=model_dtype)
+        siglip_pixels = siglip_pixels.to(device=device, dtype=model_dtype)
 
         # Get features from DINOv2 using second-to-last layer
         n_blocks = len(self.featurizer.blocks)
@@ -591,7 +600,60 @@ class OpenVLADummyInputsBuilder(BaseDummyInputsBuilder[OpenVLAProcessingInfo]):
 
 
 class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo]):
-    """Multi-modal processor for OpenVLA."""
+    """Multi-modal processor for OpenVLA.
+
+    Uses custom 6-channel preprocessing to match HuggingFace exactly:
+    - Channels 0-2: DINOv2 normalized (HF's quantized ImageNet stats)
+    - Channels 3-5: SigLIP normalized (0.5 mean/std)
+
+    This avoids bfloat16 precision loss during runtime conversion.
+    """
+
+    # HF's exact quantized normalization values for bfloat16 compatibility
+    IMAGENET_MEAN = [0.484375, 0.455078125, 0.40625]
+    IMAGENET_STD = [0.228515625, 0.2236328125, 0.224609375]
+    SIGLIP_MEAN = [0.5, 0.5, 0.5]
+    SIGLIP_STD = [0.5, 0.5, 0.5]
+
+    def _preprocess_image_6channel(self, image) -> torch.Tensor:
+        """Preprocess image into 6-channel tensor with both normalizations.
+
+        Args:
+            image: PIL Image to process.
+
+        Returns:
+            Tensor of shape (6, 224, 224) with DINOv2 and SigLIP normalizations.
+        """
+        import numpy as np
+        from PIL import Image as PILImage
+
+        # Ensure RGB and resize to 224x224
+        if not isinstance(image, PILImage.Image):
+            image = PILImage.open(image).convert("RGB")
+        else:
+            image = image.convert("RGB")
+
+        image = image.resize((224, 224), PILImage.BILINEAR)
+
+        # Convert to float32 numpy array normalized to [0, 1]
+        raw = np.array(image, dtype=np.float32) / 255.0
+
+        # DINOv2 normalization (HF's exact quantized ImageNet stats)
+        dinov2_mean = np.array(self.IMAGENET_MEAN, dtype=np.float32)
+        dinov2_std = np.array(self.IMAGENET_STD, dtype=np.float32)
+        dinov2_pixels = (raw - dinov2_mean) / dinov2_std
+        dinov2_pixels = dinov2_pixels.transpose(2, 0, 1)  # HWC -> CHW
+
+        # SigLIP normalization
+        siglip_mean = np.array(self.SIGLIP_MEAN, dtype=np.float32)
+        siglip_std = np.array(self.SIGLIP_STD, dtype=np.float32)
+        siglip_pixels = (raw - siglip_mean) / siglip_std
+        siglip_pixels = siglip_pixels.transpose(2, 0, 1)  # HWC -> CHW
+
+        # Stack into 6-channel tensor: [DINOv2(3), SigLIP(3)]
+        pixel_values = np.concatenate([dinov2_pixels, siglip_pixels], axis=0)
+
+        return torch.from_numpy(pixel_values)
 
     def _apply_hf_processor_text_only(
         self,
@@ -607,39 +669,98 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         # Use add_special_tokens=True to include BOS token for prefix matching
         return tokenizer.encode(prompt_text, add_special_tokens=True)
 
+    def _apply_hf_processor_text_mm(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> tuple[list[int], BatchFeature, bool]:
+        """Apply custom 6-channel preprocessing for OpenVLA.
+
+        This overrides the base implementation to use our custom preprocessing
+        that precomputes both DINOv2 and SigLIP normalizations in float32.
+        """
+        import PIL.Image
+
+        # Tokenize the text
+        tokenizer = self.info.ctx.tokenizer
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
+
+        # Process images with 6-channel preprocessing
+        mm_counts = mm_items.get_all_counts()
+        num_images = mm_counts.get("image", 0)
+
+        if num_images == 0:
+            # Create dummy for profiling
+            dummy_image = PIL.Image.new("RGB", (224, 224), color=(128, 128, 128))
+            images = [dummy_image]
+        else:
+            image_items = mm_items.get("image")
+            if image_items is not None:
+                images = list(image_items)
+            else:
+                dummy_image = PIL.Image.new("RGB", (224, 224), color=(128, 128, 128))
+                images = [dummy_image]
+
+        # Process each image with 6-channel preprocessing
+        pixel_values_list = []
+        for img in images:
+            pixel_values = self._preprocess_image_6channel(img)
+            pixel_values_list.append(pixel_values)
+
+        # Stack into batch tensor: (num_images, 6, 224, 224)
+        pixel_values = torch.stack(pixel_values_list, dim=0)
+
+        processed_data = BatchFeature({"pixel_values": pixel_values})
+
+        # OpenVLA doesn't apply prompt updates via HF processor
+        is_update_applied = False
+
+        return prompt_ids, processed_data, is_update_applied
+
     def _apply_hf_processor_mm_only(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        """Apply HF processor on multimodal data.
+        """Process multimodal data with custom 6-channel preprocessing.
 
-        OpenVLA's PrismaticProcessor requires images, so we generate dummy
-        images if needed for profiling.
+        Uses custom preprocessing to create 6-channel tensors with both
+        DINOv2 and SigLIP normalizations precomputed in float32.
+        This matches HuggingFace exactly and avoids bfloat16 precision loss.
         """
+        import PIL.Image
+
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
 
-        # If no images, create dummy images for profiling
+        # Handle no images case (profiling)
         if num_images == 0:
             num_images = self.allowed_mm_limits.get("image", 1)
-            # Create a dummy image for profiling
-            import PIL.Image
             dummy_image = PIL.Image.new("RGB", (224, 224), color=(128, 128, 128))
-            # Create dummy mm_items with the dummy image
-            from vllm.multimodal.parse import ImageProcessorItems
-            mm_items = MultiModalDataItems({"image": ImageProcessorItems([dummy_image])})
-            mm_counts = {"image": num_images}
+            images = [dummy_image]
+        else:
+            # Extract images from mm_items
+            image_items = mm_items.get("image")
+            if image_items is not None:
+                images = list(image_items)
+            else:
+                dummy_image = PIL.Image.new("RGB", (224, 224), color=(128, 128, 128))
+                images = [dummy_image]
 
-        _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
-            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-        )
+        # Process each image with 6-channel preprocessing
+        pixel_values_list = []
+        for img in images:
+            pixel_values = self._preprocess_image_6channel(img)
+            pixel_values_list.append(pixel_values)
 
-        return mm_processed_data
+        # Stack into batch tensor: (num_images, 6, 224, 224)
+        pixel_values = torch.stack(pixel_values_list, dim=0)
+
+        # Return as BatchFeature-like dict
+        return BatchFeature({"pixel_values": pixel_values})
 
     def _get_mm_fields_config(
         self,
