@@ -39,7 +39,8 @@ from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     InputProcessingContext,
-    PromptReplacement,
+    PromptIndexTargets,
+    PromptInsertion,
     PromptUpdate,
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
@@ -287,6 +288,19 @@ class OpenVLADummyInputsBuilder(BaseDummyInputsBuilder[OpenVLAProcessingInfo]):
 class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo]):
     """Multi-modal processor for OpenVLA."""
 
+    def _apply_hf_processor_text_only(
+        self,
+        prompt_text: str,
+        tokenization_kwargs: Mapping[str, object],
+    ) -> list[int]:
+        """Tokenize text without using the HF processor.
+
+        OpenVLA's PrismaticProcessor requires images even for text tokenization,
+        so we use the tokenizer directly for text-only processing.
+        """
+        tokenizer = self.info.ctx.tokenizer
+        return tokenizer.encode(prompt_text, add_special_tokens=False)
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -303,20 +317,22 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_config = self.info.get_hf_config()
-        image_token_id = hf_config.image_token_index
+        # Use pad_token_id (32000) as placeholder for image features
+        image_token_id = hf_config.pad_token_id
 
-        def get_replacement(item_idx: int):
+        def get_insertion(item_idx: int):
             num_image_tokens = self.info.get_num_image_tokens(
                 image_width=224,
                 image_height=224,
             )
             return [image_token_id] * num_image_tokens
 
+        # Insert image placeholder tokens at the start of the prompt (after BOS)
         return [
-            PromptReplacement(
+            PromptInsertion(
                 modality="image",
-                target=[image_token_id],
-                replacement=get_replacement,
+                target=PromptIndexTargets.start(),
+                insertion=get_insertion,
             ),
         ]
 

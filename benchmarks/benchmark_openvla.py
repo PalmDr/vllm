@@ -57,6 +57,7 @@ def main() -> int:
         model=args.model,
         max_model_len=args.max_model_len,
         limit_mm_per_prompt={"image": 1},
+        trust_remote_code=True,
     )
     llm = LLM(**(asdict(engine_args) | {"seed": 0}))
 
