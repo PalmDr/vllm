@@ -821,6 +821,7 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "OpenCUAForConditionalGeneration": _HfExamplesInfo(
         "xlangai/OpenCUA-7B", trust_remote_code=True
     ),
+    "OpenVLAForActionPrediction": _HfExamplesInfo("openvla/openvla-7b"),
     "Ovis": _HfExamplesInfo(
         "AIDC-AI/Ovis2-1B",
         trust_remote_code=True,

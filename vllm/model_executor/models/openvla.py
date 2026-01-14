@@ -16,7 +16,7 @@ from typing import ClassVar, Final, Literal, Optional
 
 import torch
 import torch.nn as nn
-from transformers import BatchFeature, PretrainedConfig
+from transformers import BatchFeature
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, MultiModalConfig
@@ -44,6 +44,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs import OpenVLAConfig
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (
@@ -224,31 +225,6 @@ class PrismaticProjector(nn.Module):
             x, _ = self.fc3(x)
 
         return x
-
-
-class OpenVLAConfig(PretrainedConfig):
-    """Configuration class for OpenVLA model."""
-
-    model_type = "openvla"
-
-    def __init__(
-        self,
-        timm_model_ids: list[str] | None = None,
-        image_sizes: list[int] | None = None,
-        use_fused_vision_backbone: bool = True,
-        image_token_index: int = 32000,
-        n_action_bins: int = 256,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.timm_model_ids = timm_model_ids or [
-            "vit_large_patch14_reg4_dinov2.lvd142m",
-            "vit_so400m_patch14_siglip_224",
-        ]
-        self.image_sizes = image_sizes or [224, 224]
-        self.use_fused_vision_backbone = use_fused_vision_backbone
-        self.image_token_index = image_token_index
-        self.n_action_bins = n_action_bins
 
 
 class OpenVLAImagePixelInputs:
