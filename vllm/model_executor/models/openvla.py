@@ -12,6 +12,7 @@ References:
 """
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import ClassVar, Final, Literal, Optional
 
 import torch
@@ -42,6 +43,7 @@ from vllm.multimodal.processing import (
     PromptIndexTargets,
     PromptInsertion,
     PromptUpdate,
+    PromptUpdateDetails,
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
@@ -56,90 +58,292 @@ from .utils import (
 )
 
 
+class LayerScale(nn.Module):
+    """Layer scale module for DINOv2."""
+
+    def __init__(self, dim: int, init_value: float = 1e-5):
+        super().__init__()
+        self.scale_factor = nn.Parameter(torch.ones(dim) * init_value)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale_factor
+
+
+class ViTMLP(nn.Module):
+    """MLP module for ViT blocks."""
+
+    def __init__(self, embed_dim: int, mlp_ratio: float = 4.0, mlp_dim: int | None = None):
+        super().__init__()
+        # Use explicit mlp_dim if provided, otherwise compute from ratio
+        hidden_dim = mlp_dim if mlp_dim is not None else int(embed_dim * mlp_ratio)
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class ViTAttention(nn.Module):
+    """Attention module for ViT blocks."""
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim**-0.5
+
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(x)
+
+
+class DINOv2Block(nn.Module):
+    """DINOv2 transformer block with layer scale."""
+
+    def __init__(self, embed_dim: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = ViTAttention(embed_dim, num_heads)
+        self.ls1 = LayerScale(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = ViTMLP(embed_dim, mlp_ratio)
+        self.ls2 = LayerScale(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.ls1(self.attn(self.norm1(x)))
+        x = x + self.ls2(self.mlp(self.norm2(x)))
+        return x
+
+
+class SigLIPBlock(nn.Module):
+    """SigLIP transformer block (no layer scale)."""
+
+    def __init__(self, embed_dim: int, num_heads: int, mlp_dim: int = 4304):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = ViTAttention(embed_dim, num_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = ViTMLP(embed_dim, mlp_dim=mlp_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class AttentionPooling(nn.Module):
+    """Attention pooling for SigLIP."""
+
+    def __init__(self, embed_dim: int, num_heads: int, mlp_dim: int = 4304):
+        super().__init__()
+        self.latent = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.q = nn.Linear(embed_dim, embed_dim)
+        self.kv = nn.Linear(embed_dim, embed_dim * 2)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.mlp = ViTMLP(embed_dim, mlp_dim=mlp_dim)
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim**-0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        latent = self.latent.expand(B, -1, -1)
+
+        q = self.q(latent).reshape(B, 1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        kv = self.kv(x).reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, 1, -1)
+        out = self.proj(out)
+        out = out + self.mlp(self.norm(out))
+        return out.squeeze(1)
+
+
+class DINOv2Encoder(nn.Module):
+    """DINOv2 vision encoder matching OpenVLA checkpoint structure.
+
+    OpenVLA uses DINOv2-Large with 4 register tokens.
+    Positional embedding is only applied to patch tokens (not CLS/register).
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        patch_size: int = 14,
+        embed_dim: int = 1024,
+        num_heads: int = 16,
+        num_blocks: int = 24,
+        mlp_ratio: float = 4.0,
+        num_register_tokens: int = 4,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.num_register_tokens = num_register_tokens
+        num_patches = (image_size // patch_size) ** 2
+
+        self.patch_embed = nn.Sequential()
+        self.patch_embed.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.reg_token = nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim))
+        # Positional embedding only for patches (256), not CLS/register tokens
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+
+        self.blocks = nn.ModuleList([
+            DINOv2Block(embed_dim, num_heads, mlp_ratio) for _ in range(num_blocks)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+
+        # Patch embedding
+        x = self.patch_embed.proj(x)
+        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+
+        # Add positional embedding to patches only
+        x = x + self.pos_embed
+
+        # Prepend CLS token and register tokens (they don't get positional embedding)
+        cls_token = self.cls_token.expand(B, -1, -1)
+        reg_tokens = self.reg_token.expand(B, -1, -1)
+        # DINOv2 with registers: [CLS, register tokens, patches]
+        x = torch.cat([cls_token, reg_tokens, x], dim=1)
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+
+        # Return patch tokens only (skip CLS and register tokens)
+        return x[:, 1 + self.num_register_tokens:, :]
+
+
+class SigLIPEncoder(nn.Module):
+    """SigLIP vision encoder matching OpenVLA checkpoint structure."""
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        patch_size: int = 14,
+        embed_dim: int = 1152,
+        num_heads: int = 16,
+        num_blocks: int = 27,
+        mlp_dim: int = 4304,  # SigLIP uses non-standard MLP dimension
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        num_patches = (image_size // patch_size) ** 2
+
+        self.patch_embed = nn.Sequential()
+        self.patch_embed.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+
+        self.blocks = nn.ModuleList([
+            SigLIPBlock(embed_dim, num_heads, mlp_dim) for _ in range(num_blocks)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.attn_pool = AttentionPooling(embed_dim, num_heads, mlp_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Patch embedding
+        x = self.patch_embed.proj(x)
+        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+
+        # Add positional embedding
+        x = x + self.pos_embed
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        return x  # Return all patch tokens
+
+
 class PrismaticVisionBackbone(nn.Module):
     """Fused vision backbone combining DINOv2 and SigLIP.
 
     OpenVLA uses a fused dual-encoder vision backbone that concatenates
     features from DINOv2 (structural/geometric) and SigLIP (semantic).
-    Both are ViT models loaded via TIMM.
     """
 
     def __init__(
         self,
-        timm_model_ids: list[str],
         image_sizes: list[int],
         use_fused_vision_backbone: bool = True,
     ):
         super().__init__()
         self.use_fused = use_fused_vision_backbone
-        self.timm_model_ids = timm_model_ids
-        self.image_sizes = image_sizes
+        image_size = image_sizes[0] if image_sizes else 224
 
-        # Will be loaded via load_weights
-        self.featurizer: Optional[nn.Module] = None
-        self.fused_featurizer: Optional[nn.Module] = None
-        self.embed_dim: Optional[int] = None
-
-    def _init_timm_models(self):
-        """Initialize TIMM models. Called after config is loaded.
-
-        Important: Must specify img_size to match OpenVLA's training configuration.
-        DINOv2 defaults to 518x518 but OpenVLA uses 224x224.
-        """
-        try:
-            import timm
-        except ImportError as e:
-            raise ImportError(
-                "timm is required for OpenVLA. Install with: pip install timm"
-            ) from e
-
-        # Get image size from config (default 224 for OpenVLA)
-        img_size = self.image_sizes[0] if self.image_sizes else 224
-
-        # Primary encoder (DINOv2)
-        # Must specify img_size=224 because DINOv2 defaults to 518x518
-        self.featurizer = timm.create_model(
-            self.timm_model_ids[0],
-            pretrained=False,  # weights loaded separately
-            num_classes=0,
-            img_size=img_size,
+        # DINOv2-Large: 1024 dim, 16 heads, 24 blocks
+        self.featurizer = DINOv2Encoder(
+            image_size=image_size,
+            patch_size=14,
+            embed_dim=1024,
+            num_heads=16,
+            num_blocks=24,
+            mlp_ratio=4.0,
+            num_register_tokens=4,
         )
-        self.embed_dim = self.featurizer.embed_dim
 
-        # Secondary encoder (SigLIP) for fused backbone
-        if self.use_fused and len(self.timm_model_ids) > 1:
-            self.fused_featurizer = timm.create_model(
-                self.timm_model_ids[1],
-                pretrained=False,
-                num_classes=0,
-                img_size=img_size,
+        # SigLIP-SO400M: 1152 dim, 16 heads, 27 blocks
+        if use_fused_vision_backbone:
+            self.fused_featurizer = SigLIPEncoder(
+                image_size=image_size,
+                patch_size=14,
+                embed_dim=1152,
+                num_heads=16,
+                num_blocks=27,
+                mlp_dim=4304,  # SigLIP uses non-standard MLP dimension
             )
-            self.embed_dim += self.fused_featurizer.embed_dim
+            self.embed_dim = 1024 + 1152  # 2176
+        else:
+            self.fused_featurizer = None
+            self.embed_dim = 1024
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Extract and fuse features from both vision encoders.
 
         Args:
-            pixel_values: Images of shape (batch, channels, height, width).
+            pixel_values: Images of shape (batch, 6, height, width) where
+                          the 6 channels are 2 stacked 3-channel images:
+                          - channels 0-2: image for DINOv2
+                          - channels 3-5: image for SigLIP
 
         Returns:
             Patch features of shape (batch, num_patches, embed_dim).
         """
-        if self.featurizer is None:
-            raise RuntimeError("Vision backbone not initialized. Call _init_timm_models first.")
+        # Split the stacked images for each encoder
+        # PrismaticProcessor outputs [batch, 6, h, w] = [batch, 2*3, h, w]
+        dinov2_images = pixel_values[:, :3, :, :]  # First 3 channels
+        siglip_images = pixel_values[:, 3:, :, :]  # Last 3 channels
 
-        # Get features from primary encoder
-        features = self.featurizer.forward_features(pixel_values)
+        features = self.featurizer(dinov2_images)
 
-        # Remove CLS token if present (keep only patch tokens)
-        if features.shape[1] > (pixel_values.shape[-1] // 14) ** 2:
-            features = features[:, 1:, :]
-
-        # Fuse with secondary encoder
         if self.use_fused and self.fused_featurizer is not None:
-            fused_features = self.fused_featurizer.forward_features(pixel_values)
-            if fused_features.shape[1] > (pixel_values.shape[-1] // 14) ** 2:
-                fused_features = fused_features[:, 1:, :]
+            fused_features = self.fused_featurizer(siglip_images)
             features = torch.cat([features, fused_features], dim=-1)
 
         return features
@@ -228,11 +432,12 @@ class PrismaticProjector(nn.Module):
         return x
 
 
+@dataclass
 class OpenVLAImagePixelInputs:
     """Schema for OpenVLA image pixel inputs."""
 
     type: Literal["pixel_values"] = "pixel_values"
-    pixel_values: torch.Tensor  # Shape: (batch * num_images, 3, height, width)
+    pixel_values: torch.Tensor = field(default=None)  # Shape: (batch * num_images, 3, height, width)
 
 
 class OpenVLAProcessingInfo(BaseProcessingInfo):
@@ -259,13 +464,25 @@ class OpenVLAProcessingInfo(BaseProcessingInfo):
     def get_max_image_tokens(self) -> int:
         return self.get_num_image_tokens(image_width=224, image_height=224)
 
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int] | None:
+        """Return the maximum number of tokens per image.
+
+        OpenVLA has a fixed image size (224x224) with 14x14 patches = 256 tokens.
+        Returning this directly avoids the profiling flow.
+        """
+        return {"image": self.get_max_image_tokens()}  # 256
+
 
 class OpenVLADummyInputsBuilder(BaseDummyInputsBuilder[OpenVLAProcessingInfo]):
     """Builds dummy inputs for profiling OpenVLA."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        num_images = mm_counts.get("image", 0)
-        return "<image>" * num_images
+        # Empty string - image tokens are inserted at prefix, not as replacement
+        return ""
 
     def get_dummy_mm_data(
         self,
@@ -299,7 +516,42 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         so we use the tokenizer directly for text-only processing.
         """
         tokenizer = self.info.ctx.tokenizer
-        return tokenizer.encode(prompt_text, add_special_tokens=False)
+        # Use add_special_tokens=True to include BOS token for prefix matching
+        return tokenizer.encode(prompt_text, add_special_tokens=True)
+
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """Apply HF processor on multimodal data.
+
+        OpenVLA's PrismaticProcessor requires images, so we generate dummy
+        images if needed for profiling.
+        """
+        mm_counts = mm_items.get_all_counts()
+        num_images = mm_counts.get("image", 0)
+
+        # If no images, create dummy images for profiling
+        if num_images == 0:
+            num_images = self.allowed_mm_limits.get("image", 1)
+            # Create a dummy image for profiling
+            import PIL.Image
+            dummy_image = PIL.Image.new("RGB", (224, 224), color=(128, 128, 128))
+            # Create dummy mm_items with the dummy image
+            from vllm.multimodal.parse import ImageProcessorItems
+            mm_items = MultiModalDataItems({"image": ImageProcessorItems([dummy_image])})
+            mm_counts = {"image": num_images}
+
+        _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
+            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+
+        return mm_processed_data
 
     def _get_mm_fields_config(
         self,
@@ -317,21 +569,32 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_config = self.info.get_hf_config()
-        # Use pad_token_id (32000) as placeholder for image features
-        image_token_id = hf_config.pad_token_id
+        # Use image_token_index (32000) as placeholder for image features
+        image_token_id = getattr(hf_config, "image_token_index", 32000)
+        # Get BOS token from tokenizer
+        tokenizer = self.info.ctx.tokenizer
+        bos_token_id = tokenizer.bos_token_id
 
         def get_insertion(item_idx: int):
             num_image_tokens = self.info.get_num_image_tokens(
                 image_width=224,
                 image_height=224,
             )
-            return [image_token_id] * num_image_tokens
+            image_tokens = [image_token_id] * num_image_tokens
 
-        # Insert image placeholder tokens at the start of the prompt (after BOS)
+            # Return with proper token selection for embeddings
+            return PromptUpdateDetails.select_token_id(
+                image_tokens,
+                embed_token_id=image_token_id,
+            )
+
+        # Insert image tokens at the start of the prompt (after BOS if present)
         return [
             PromptInsertion(
                 modality="image",
-                target=PromptIndexTargets.start(),
+                target=PromptIndexTargets.prefix(
+                    [bos_token_id] if bos_token_id is not None else []
+                ),
                 insertion=get_insertion,
             ),
         ]
@@ -380,7 +643,9 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
-            return "<image>"
+            # Return None because image tokens are inserted at prefix,
+            # not replaced from a placeholder string in the prompt
+            return None
         raise ValueError("Only image modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -407,12 +672,19 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
         # Vision backbone
         if multimodal_config is not None and multimodal_config.get_limit_per_prompt("image"):
             self.vision_backbone = PrismaticVisionBackbone(
-                timm_model_ids=self.timm_model_ids,
                 image_sizes=self.image_sizes,
                 use_fused_vision_backbone=self.use_fused_vision_backbone,
             )
-            # Projector will be initialized after vision backbone loads
-            self.projector: Optional[PrismaticProjector] = None
+            # Get LLM hidden dim from text_config
+            text_config = getattr(config, "text_config", None)
+            llm_dim = getattr(text_config, "hidden_size", 4096) if text_config else 4096
+            # Create projector with known dimensions
+            self.projector = PrismaticProjector(
+                vision_dim=self.vision_backbone.embed_dim,  # 2176 for fused
+                llm_dim=llm_dim,
+                use_fused=self.use_fused_vision_backbone,
+                prefix="projector",
+            )
         else:
             self.vision_backbone = None
             self.projector = None
@@ -515,20 +787,6 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
         - projector.fc1/fc2/fc3.* -> Projector weights
         - language_model.* -> Llama weights
         """
-        # Initialize vision backbone TIMM models
-        if self.vision_backbone is not None:
-            self.vision_backbone._init_timm_models()
-
-            # Initialize projector after we know vision dimensions
-            vision_dim = self.vision_backbone.embed_dim
-            llm_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 4096
-            self.projector = PrismaticProjector(
-                vision_dim=vision_dim,
-                llm_dim=llm_dim,
-                use_fused=self.use_fused_vision_backbone,
-                prefix="projector",
-            )
-
         skip_prefixes = []
         if self.vision_backbone is None and self.projector is None:
             skip_prefixes.extend(["vision_backbone.", "projector."])

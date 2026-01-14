@@ -15,8 +15,14 @@ from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.cuda import CudaPlatform
 from vllm import EngineArgs, LLM, SamplingParams
 
-ACTION_TOKEN_OFFSET = 32000
-ACTION_TOKEN_MAX = 32255
+# OpenVLA action token range
+# Formula: bin_index = vocab_size - token - 1, where vocab_size = 32000
+# Bins are in range [0, 255], so tokens are in range [31744, 31999]
+# See: https://huggingface.co/openvla/openvla-7b
+VOCAB_SIZE = 32000
+N_ACTION_BINS = 256
+ACTION_TOKEN_MIN = VOCAB_SIZE - N_ACTION_BINS  # 31744
+ACTION_TOKEN_MAX = VOCAB_SIZE - 1  # 31999
 
 
 def _percentiles(values: list[float], percentiles: list[int]) -> dict[int, float]:
@@ -69,8 +75,12 @@ def main() -> int:
     )
 
     image = ImageAsset("stop_sign").pil_image
+    # OpenVLA expects a specific prompt format with the instruction
+    # Image tokens are inserted at the prefix (before the text prompt)
+    instruction = "pick up the object"
+    prompt = f"In: What action should the robot take to {instruction}?\nOut:"
     request = {
-        "prompt": "<image>",
+        "prompt": prompt,
         "multi_modal_data": {"image": [image]},
     }
 
@@ -81,11 +91,14 @@ def main() -> int:
 
         output = outputs[0]
         metrics = output.metrics
-        prompt_tokens = len(output.prompt_token_ids or [])
+        prompt_token_ids = output.prompt_token_ids or []
+        prompt_tokens = len(prompt_token_ids)
         output_tokens = len(output.outputs[0].token_ids)
         token_ids = output.outputs[0].token_ids
 
-        if not all(ACTION_TOKEN_OFFSET <= tok <= ACTION_TOKEN_MAX for tok in token_ids):
+        if not all(ACTION_TOKEN_MIN <= tok <= ACTION_TOKEN_MAX for tok in token_ids):
+            print(f"Output token IDs: {token_ids}")
+            print(f"Expected tokens in range [{ACTION_TOKEN_MIN}, {ACTION_TOKEN_MAX}]")
             raise RuntimeError("OpenVLA output tokens are outside action range.")
 
         record = {
